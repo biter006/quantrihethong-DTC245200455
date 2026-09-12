@@ -1,0 +1,333 @@
+#!/usr/bin/env bash
+# =====================================================================
+# Bai lab 7 -- CAI DAT SACH, doc lap hoan toan voi cac bai lab truoc.
+#
+#   ./cai-dat.sh k23            # cai sach: xoa stack cu roi dung lai
+#   ./cai-dat.sh k23 --giu      # giu du lieu dang co, chi nap lai cau hinh
+#   ./cai-dat.sh k23 --mo-lan   # pho Grafana/Prometheus ra mang (xem ghi chu)
+#
+# Chay bao nhieu lan cung ra dung mot ket qua.
+# =====================================================================
+set -euo pipefail
+
+MSSV="${1:?Cach dung: ./cai-dat.sh <MSSV>   (vi du: ./cai-dat.sh k23)}"
+case "$MSSV" in --*) echo "LOI: tham so dau tien phai la MSSV, khong phai co."; exit 1;; esac
+GIU=0
+MO_LAN=0
+for t in "$@"; do
+  [ "$t" = "--giu" ]    && GIU=1
+  [ "$t" = "--mo-lan" ] && MO_LAN=1
+done
+
+# Dia chi ma Prometheus va Grafana lang nghe.
+#   127.0.0.1  chi vao duoc TU TRONG may ao -- yeu cau cua Moc 7.
+#              Tu may that thi mo duong ham SSH.
+#   0.0.0.0    vao duoc tu may that bang http://<IP-may-ao>:3000
+#              Tien cho buoi hoc, nhung VI PHAM tieu chi Moc 7.
+if [ "$MO_LAN" -eq 1 ]; then BIND_ADDR="0.0.0.0"; else BIND_ADDR="127.0.0.1"; fi
+cd "$(dirname "$0")"
+
+echo "=================================================================="
+echo " BAI LAB 7 -- CAI DAT   (MSSV = $MSSV)"
+echo "=================================================================="
+
+# ---------------------------------------------------------------------
+# 0. Doi hoi ve moi truong
+# ---------------------------------------------------------------------
+if ! docker info >/dev/null 2>&1; then
+  echo "LOI: khong goi duoc Docker."
+  echo "     Chua cai  -> chay:  ./cai-dat-docker.sh"
+  echo "     Da cai roi -> nhom docker chua co hieu luc, go:  newgrp docker"
+  exit 1
+fi
+
+drv=$(docker info --format '{{.Driver}}')
+if [ "$drv" != "overlay2" ]; then
+  echo "!! Trinh luu tru o dia dang la \"$drv\", khong phai overlay2."
+  echo "!! cAdvisor se KHONG doc duoc chi so cua tung container, va bieu do"
+  echo "!! \"CPU tung container\" o Buoc 12 se trong rong ma khong bao loi."
+  echo "!! Xu ly: xem muc Su co trong tai lieu, roi chay lai script nay."
+  echo
+fi
+
+# ---------------------------------------------------------------------
+# 1. Chuan hoa xuong dong
+# File di qua Windows mang ky tu CR o cuoi dong. Bash doc CR nhu mot
+# phan cua gia tri, Docker Compose thi cat bo -- mot ky tu vo hinh la du
+# gay "Access denied". Cat sach ngay tu dau.
+# ---------------------------------------------------------------------
+find . -type f \( -name '*.sh' -o -name '*.sql' -o -name '*.yml' \
+     -o -name '*.cnf' -o -name '*.example' -o -name '.env' \) -print0 \
+  | xargs -0 -r sed -i 's/\r$//'
+chmod +x ./*.sh 2>/dev/null || true
+
+# ---------------------------------------------------------------------
+# 2. Khoi phuc file cau hinh ve ban goc roi moi thay MSSV
+# Dung chinh chuoi "MSSV" lam dau nhan biet:
+#   - File con chua chu MSSV -> ban goc (vua keo ve tu git). Cap nhat .mau/
+#   - File khong con MSSV nhung .mau/ co -> da thay o lan truoc. Khoi phuc.
+#   - Ca hai deu khong co -> khong co cho de thay. De yen.
+# Nho quy tac dau, sau "git pull" ban moi duoc dung ngay, khong bi ban
+# cu trong .mau/ de len.
+# ---------------------------------------------------------------------
+mkdir -p .mau/monitoring
+for f in monitoring/prometheus.yml; do
+  [ -f "$f" ] || continue
+  if grep -q 'MSSV' "$f"; then
+    cp -f "$f" ".mau/$f"
+  elif [ -f ".mau/$f" ] && grep -q 'MSSV' ".mau/$f"; then
+    cp -f ".mau/$f" "$f"
+  fi
+done
+sed -i "s/MSSV/$MSSV/g" monitoring/prometheus.yml
+echo "==> Da thay MSSV = $MSSV trong monitoring/"
+
+# ---------------------------------------------------------------------
+# 3. Mat khau -- chi ton tai o DUNG MOT CHO
+# Cac bien duoi day la nguon duy nhat. Tu chung ghi ra .env cho Compose,
+# ghi ra my.cnf cho mysql-exporter, va cung chinh chung duoc truyen thang
+# cho lenh mysql. Script KHONG "source .env", nen khong the co chuyen
+# Compose va Bash doc ra hai chuoi khac nhau.
+# ---------------------------------------------------------------------
+export MSSV
+export WP_DB="wp_$MSSV"
+export WP_USER="wp_$MSSV"
+export WP_PASSWORD="WpMatKhau_${MSSV}_2026"
+export MYSQL_ROOT_PASSWORD="RootMySQL_${MSSV}_2026"
+export EXPORTER_USER="exporter_$MSSV"
+export EXPORTER_PASSWORD="Exporter_${MSSV}_2026"
+export GRAFANA_USER="admin"
+export GRAFANA_PASSWORD="Grafana_${MSSV}_2026"
+export BIND_ADDR
+
+# UID/GID cua nguoi dang chay script. Dung cho mysql-exporter -- xem phan
+# sinh my.cnf o duoi de biet tai sao.
+export HOST_UID="$(id -u)"
+export HOST_GID="$(id -g)"
+
+if [ "$GIU" -eq 1 ] && [ -f .env ]; then
+  echo "==> --giu: dung lai .env dang co"
+  set -a; . ./.env; set +a
+  # .env sinh boi ban cu chua co HOST_UID/HOST_GID -- bo sung cho du,
+  # neu khong Compose se doc ra chuoi rong o muc "user:" cua mysql-exporter.
+  grep -q '^HOST_UID=' .env || printf 'HOST_UID=%s\nHOST_GID=%s\n' "$(id -u)" "$(id -g)" >> .env
+  export HOST_UID="$(id -u)" HOST_GID="$(id -g)"
+else
+  printf '%s\n' \
+    "# File nay do cai-dat.sh sinh ra. Sua tay se bi ghi de o lan chay sau." \
+    "MSSV=$MSSV" \
+    "WP_DB=$WP_DB" \
+    "WP_USER=$WP_USER" \
+    "WP_PASSWORD=$WP_PASSWORD" \
+    "MYSQL_ROOT_PASSWORD=$MYSQL_ROOT_PASSWORD" \
+    "EXPORTER_USER=$EXPORTER_USER" \
+    "EXPORTER_PASSWORD=$EXPORTER_PASSWORD" \
+    "GRAFANA_USER=$GRAFANA_USER" \
+    "GRAFANA_PASSWORD=$GRAFANA_PASSWORD" \
+    "BIND_ADDR=$BIND_ADDR" \
+    "HOST_UID=$HOST_UID" \
+    "HOST_GID=$HOST_GID" > .env
+  echo "==> Da sinh .env  (BIND_ADDR=$BIND_ADDR)"
+fi
+
+if [ "$BIND_ADDR" = "0.0.0.0" ]; then
+  echo
+  echo "!! --mo-lan: Prometheus va Grafana se PHO RA MANG, vao duoc tu may that"
+  echo "!! bang http://<IP-may-ao>:3000. Tien cho buoi hoc, nhung VI PHAM tieu"
+  echo "!! chi Moc 7 (\"Grafana chi nghe tren 127.0.0.1\"). Truoc khi nop bai du"
+  echo "!! an, chay lai KHONG co co nay."
+  echo
+fi
+
+# my.cnf cho mysql-exporter -- sinh tu cung bo bien o tren.
+# Tu ban 0.15.0 mysqld_exporter KHONG con doc DATA_SOURCE_NAME nua.
+printf '%s\n' \
+  "# File nay do cai-dat.sh sinh ra. KHONG commit len Git." \
+  "[client]" \
+  "user = $EXPORTER_USER" \
+  "password = $EXPORTER_PASSWORD" \
+  "host = mysql-db" \
+  "port = 3306" > monitoring/my.cnf
+# File nay chua mat khau, nen de 600: chi chu so huu doc duoc.
+#
+# Nhung o day co mot cai bay. Anh prom/mysqld-exporter chay duoi tai khoan
+# "nobody" (UID 65534). File tren may that thuoc ve NGUOI CHAY SCRIPT, che do
+# 600 -- nen tien trinh trong container KHONG doc noi:
+#     Error parsing host config ... permission denied
+# va container quay vong khoi dong lai mai.
+#
+# Co ba cach chua. Cho exporter chay bang root thi doc duoc nhung mat nguyen
+# tac dac quyen toi thieu. Ha xuong 644 thi moi tai khoan tren may ao deu doc
+# duoc mat khau. Cach chon o day: bat container chay DUNG bang UID cua nguoi
+# dung (bien HOST_UID o .env, khai o muc "user:" cua dich vu mysql-exporter).
+# File van 600, exporter van khong phai root, ma van doc duoc file cua chinh no.
+chmod 600 monitoring/my.cnf
+echo "==> Da sinh monitoring/my.cnf cho mysql-exporter (UID $HOST_UID)"
+
+# ---------------------------------------------------------------------
+# 4. Don rieng stack bai lab 7
+# ---------------------------------------------------------------------
+if [ "$GIU" -eq 0 ]; then
+  echo "==> Don stack bai lab 7 cu (neu co)"
+  docker compose down -v --remove-orphans >/dev/null 2>&1 || true
+  # CAN THAN: "docker rm -f <ten-khong-ton-tai>" tra ve MA THOAT 0 (chi in
+  # loi ra stderr). Neu chi dua vao "&& echo" thi script se bao da xoa ca
+  # bay container ngay ca khi chua he co container nao -- rat de hieu nham.
+  # Vi vay phai HOI TRUOC xem container co ton tai khong.
+  for c in wordpress mysql-db prometheus grafana node-exporter cadvisor mysql-exporter; do
+    if [ -n "$(docker ps -aq -f "name=^${c}$" 2>/dev/null)" ]; then
+      docker rm -f "$c" >/dev/null 2>&1
+      echo "    - da xoa container con sot: $c"
+    fi
+  done
+fi
+
+for cong in 8080 9090 3000; do
+  for ai in $(docker ps --format '{{.Names}} {{.Ports}}' 2>/dev/null | grep ":$cong->" | awk '{print $1}'); do
+    # Container cua CHINH stack nay thi khong phai xung dot: "docker compose up -d"
+    # se tu thay the no. Truoc day cho nay bao loi voi ca container cua minh, nen
+    # "./cai-dat.sh <MSSV> --giu" luon chet ngay o buoc kiem cong khi stack dang chay.
+    # Chi bao loi khi ke dang chiem cong la nguoi ngoai du an.
+    du_an=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$ai" 2>/dev/null || true)
+    [ "$du_an" = "bai7-lab" ] && continue
+    echo "LOI: cong $cong dang bi container \"$ai\" chiem (khong thuoc bai lab 7)."
+    echo "     Dung no roi chay lai:  docker rm -f $ai"
+    exit 1
+  done
+done
+
+# ---------------------------------------------------------------------
+# 5. Dung stack
+# ---------------------------------------------------------------------
+# Tai tung anh mot. Neu goi chung "docker compose up", loi "manifest
+# unknown" khong noi ro anh nao hong -- rat mat cong tim.
+echo "==> Tai bay anh Docker (lan dau khoang 1,5 GB, mat vai phut)"
+thieu=0
+for anh in $(docker compose config --images); do
+  printf "    %-40s " "$anh"
+  if docker image inspect "$anh" >/dev/null 2>&1; then
+    echo "da co"
+  elif docker pull -q "$anh" >/dev/null 2>&1; then
+    echo "da tai ve"
+  else
+    echo "KHONG TAI DUOC"
+    thieu=1
+  fi
+done
+if [ "$thieu" -eq 1 ]; then
+  echo
+  echo "LOI: it nhat mot anh khong tai duoc."
+  echo "     Kiem mang:  ping -c1 registry-1.docker.io"
+  exit 1
+fi
+
+echo "==> Dung stack"
+docker compose up -d
+
+# ---------------------------------------------------------------------
+# 6. Cho toi khi Prometheus THAY DU BON TARGET O TRANG THAI UP
+# "container dang chay" chua du: Prometheus van song ngay ca khi moi
+# target deu hong. Phep thu dung la hoi chinh Prometheus xem no dang
+# thay gi.
+# ---------------------------------------------------------------------
+dem_up() {
+  docker compose exec -T prometheus \
+    wget -qO- 'http://localhost:9090/api/v1/targets?state=active' 2>/dev/null \
+    | grep -o '"health":"up"' | wc -l
+}
+
+echo "==> Cho bon target len UP (toi da 4 phut)"
+n=0
+for i in $(seq 1 48); do
+  n=$(dem_up 2>/dev/null || echo 0)
+  printf "\r    Target UP: %s/4  (%ds)" "$n" "$((i*5))"
+  [ "$n" -ge 4 ] && break
+  sleep 5
+done
+echo
+
+if [ "$n" -lt 4 ]; then
+  echo
+  echo "=================================================================="
+  echo " CHUA DU BON TARGET -- thong tin de chan doan"
+  echo "=================================================================="
+  docker compose exec -T prometheus \
+    wget -qO- 'http://localhost:9090/api/v1/targets?state=active' 2>/dev/null \
+    | tr ',' '\n' | grep -E '"job"|"health"|lastError' | sed 's/^/   /' | head -40
+  echo
+  echo " Doc cot lastError de biet target nao hong va vi sao."
+  echo " Nhat ky cua tung dich vu:  docker compose logs <ten-dich-vu>"
+  echo "=================================================================="
+fi
+
+# ---------------------------------------------------------------------
+# 7. Ghi lai PHIEN BAN THAT da dung
+#
+# docker-compose.yml dung the ":latest" de bai lab cai duoc ngay tren moi
+# may. Nhung ":latest" hom nay va ":latest" thang sau co the la hai ban
+# khac nhau -- nghia la he thong KHONG tai lap duoc.
+#
+# Cach xu ly dung: cai bang latest, roi GHI LAI dung ban minh da nhan,
+# kem ca ma bam (digest). File nay dua vao Git. Khi can dung lai y het
+# he thong cua hom nay -- vi du de dieu tra mot su co -- thi ghim theo
+# ma bam trong file nay.
+# ---------------------------------------------------------------------
+{
+  echo "# Phien ban that da dung, sinh luc: $(date '+%d/%m/%Y %H:%M:%S')"
+  echo "# May: $(hostname)   MSSV: $MSSV"
+  echo
+  docker compose images --format table 2>/dev/null \
+    || docker compose images 2>/dev/null
+  echo
+  echo "# Ma bam day du (dung de ghim tuyet doi):"
+  for anh in $(docker compose config --images); do
+    d=$(docker image inspect "$anh" --format '{{index .RepoDigests 0}}' 2>/dev/null)
+    [ -n "$d" ] && echo "#   $d"
+  done
+} > phien-ban-da-dung.txt
+echo "==> Da ghi phien-ban-da-dung.txt"
+
+# ---------------------------------------------------------------------
+# 8. Bao cao
+# ---------------------------------------------------------------------
+IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+echo
+echo "=================================================================="
+echo " CAI DAT XONG"
+echo "=================================================================="
+docker compose ps --format 'table {{.Name}}\t{{.Status}}\t{{.Ports}}'
+cat <<HD
+
+ WordPress  : http://${IP:-<IP-may-ao>}:8080
+HD
+
+if [ "$BIND_ADDR" = "0.0.0.0" ]; then
+cat <<HD
+ Grafana    : http://${IP:-<IP-may-ao>}:3000   ($GRAFANA_USER / $GRAFANA_PASSWORD)
+ Prometheus : http://${IP:-<IP-may-ao>}:9090
+
+ (Dang o che do --mo-lan: vao thang tu may that bang dia chi tren.)
+HD
+else
+cat <<HD
+ Grafana va Prometheus chi nghe tren 127.0.0.1 cua may ao. Hai cach xem:
+
+ CACH 1 -- may ao co giao dien do hoa:
+   Mo trinh duyet NGAY TRONG may ao:
+     Grafana    : http://localhost:3000   ($GRAFANA_USER / $GRAFANA_PASSWORD)
+     Prometheus : http://localhost:9090
+
+ CACH 2 -- may ao chi co dong lenh: mo duong ham SSH TU MAY THAT:
+   ssh -L 3000:127.0.0.1:3000 -L 9090:127.0.0.1:9090 $(whoami)@${IP:-<IP-may-ao>}
+   Roi mo tren may that: http://localhost:3000
+
+ Muon vao thang bang IP tu may that thi chay lai voi co --mo-lan.
+HD
+fi
+
+cat <<HD
+
+ Buoc tiep theo:
+   ./kiem-tra.sh $MSSV        # kiem chung toan bo
+   ./tao-tai.sh 120           # sinh tai gia 120 giay de thay dinh CPU
+HD
