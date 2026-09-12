@@ -1,7 +1,7 @@
 <?php get_header(); ?>
 
 <div class="hop-demo">
-    <h3>Vòng đời triển khai đang chạy trước mắt</h3>
+    <h3>Vòng 3 - nội dung giới thiệu đã được cập nhật</h3>
     <p>Nội dung trong hộp này nằm ở file <code>index.php</code> của theme K23, được lưu trên GitHub.
        Sửa trên máy tính → đẩy lên GitHub → máy chủ kéo về → tải lại trang là thấy đổi.</p>
     <p><b>Thông điệp hiện tại:</b> Xin chào lớp K23.</p>
